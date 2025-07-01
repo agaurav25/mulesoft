@@ -1,0 +1,714 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xmlns:http="http://www.mulesoft.org/schema/mule/http"
+        xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+        xmlns:db="http://www.mulesoft.org/schema/mule/db"
+        xmlns:jms="http://www.mulesoft.org/schema/mule/jms"
+        xmlns:file="http://www.mulesoft.org/schema/mule/file"
+        xmlns:validation="http://www.mulesoft.org/schema/mule/validation"
+        xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+        xmlns:email="http://www.mulesoft.org/schema/mule/email"
+        xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+                http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+                http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+                http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+                http://www.mulesoft.org/schema/mule/jms http://www.mulesoft.org/schema/mule/jms/current/mule-jms.xsd
+                http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+                http://www.mulesoft.org/schema/mule/validation http://www.mulesoft.org/schema/mule/validation/current/mule-validation.xsd
+                http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+                http://www.mulesoft.org/schema/mule/email http://www.mulesoft.org/schema/mule/email/current/mule-email.xsd">
+
+        <http:listener-config name="order-api-httpListenerConfig" host="0.0.0.0" port="8082" />
+        <http:request-config name="HTTP_Request_configuration" host="api.payment-gateway.com" port="443" protocol="HTTPS"/>
+        
+        <db:config name="Orders_Database_Config">
+                <db:my-sql-connection host="orders-db.company.com" port="3306" user="orders_user" password="orders_pass" database="orders_db" />
+        </db:config>
+        
+        <jms:config name="JMS_Config" connectionFactory="jmsConnectionFactory">
+                <jms:active-mq-connection factoryConfiguration="factoryConfig" />
+        </jms:config>
+        
+        <salesforce:sfdc-config name="Salesforce_Config" username="integration@company.com" password="salesforce_password" securityToken="security_token" />
+        
+        <email:smtp-config name="Email_SMTP" host="smtp.company.com" port="587" user="notifications@company.com" password="email_password">
+                <email:smtp-connection tlsContext="TLS_Context" />
+        </email:smtp-config>
+
+        <flow name="order-processing-main">
+                <http:listener doc:name="Order Processing Listener" config-ref="order-api-httpListenerConfig" path="/orders/*"/>
+                <logger level="INFO" doc:name="Log Request" message="Processing order request: #[attributes.requestPath]"/>
+                <choice doc:name="Route by Method">
+                        <when expression="#[attributes.method == 'POST' and attributes.requestPath == '/orders/create']">
+                                <flow-ref doc:name="Create Order Flow" name="create-order-flow"/>
+                        </when>
+                        <when expression="#[attributes.method == 'PUT' and attributes.requestPath startsWith '/orders/']">
+                                <flow-ref doc:name="Update Order Flow" name="update-order-flow"/>
+                        </when>
+                        <when expression="#[attributes.method == 'GET' and attributes.requestPath startsWith '/orders/']">
+                                <flow-ref doc:name="Get Order Flow" name="get-order-flow"/>
+                        </when>
+                        <when expression="#[attributes.method == 'POST' and attributes.requestPath == '/orders/batch-process']">
+                                <flow-ref doc:name="Batch Process Flow" name="batch-process-orders-flow"/>
+                        </when>
+                        <otherwise>
+                                <ee:transform doc:name="Method Not Allowed">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        error: "METHOD_NOT_ALLOWED",
+        message: "The requested method is not supported for this endpoint",
+        timestamp: now()
+}]]></ee:set-payload>
+                                        </ee:message>
+                                        <ee:variables>
+                                                <ee:set-variable variableName="httpStatus">405</ee:set-variable>
+                                        </ee:variables>
+                                </ee:transform>
+                        </otherwise>
+                </choice>
+                <error-handler>
+                        <on-error-propagate enableNotifications="true" logException="true" doc:name="Global Error Handler" type="ANY">
+                                <logger level="ERROR" doc:name="Log Error" message="Unhandled error in order processing: #[error.description]"/>
+                                <ee:transform doc:name="Global Error Response">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        error: "INTERNAL_SERVER_ERROR",
+        message: "An unexpected error occurred while processing your request",
+        timestamp: now(),
+        correlationId: correlationId
+}]]></ee:set-payload>
+                                        </ee:message>
+                                        <ee:variables>
+                                                <ee:set-variable variableName="httpStatus">500</ee:set-variable>
+                                        </ee:variables>
+                                </ee:transform>
+                        </on-error-propagate>
+                </error-handler>
+        </flow>
+
+        <flow name="create-order-flow">
+                <logger level="INFO" doc:name="Start Order Creation" message="Starting order creation process"/>
+                <set-variable value="#[uuid()]" doc:name="Generate Order ID" variableName="orderId"/>
+                <set-variable value="#[now()]" doc:name="Set Order Timestamp" variableName="orderTimestamp"/>
+                
+                <!-- Input Validation -->
+                <ee:transform doc:name="Validate Order Input">
+                        <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+import * from dw::core::Arrays
+import * from dw::core::Objects
+
+var requiredFields = ["customerId", "items", "shippingAddress", "paymentMethod"]
+var orderData = payload
+
+fun validateOrderItem(item) = 
+        if (isEmpty(item.productId)) "Product ID is required for all items"
+        else if (isEmpty(item.quantity) or item.quantity <= 0) "Valid quantity is required for all items"
+        else if (isEmpty(item.unitPrice) or item.unitPrice <= 0) "Valid unit price is required for all items"
+        else null
+
+var validationErrors = flatten([
+        requiredFields map (field) -> 
+                if (isEmpty(orderData[field])) "Field " ++ field ++ " is required"
+                else null,
+        if (!isEmpty(orderData.items))
+                orderData.items map validateOrderItem($)
+        else ["At least one item is required"]
+]) filter ($ != null)
+
+var totalAmount = if (!isEmpty(orderData.items))
+        sum(orderData.items map ($.quantity * $.unitPrice))
+else 0
+
+---
+{
+        isValid: isEmpty(validationErrors),
+        errors: validationErrors,
+        validatedData: if (isEmpty(validationErrors)) orderData else {},
+        calculatedTotal: totalAmount,
+        orderId: vars.orderId,
+        timestamp: vars.orderTimestamp
+}]]></ee:set-payload>
+                        </ee:message>
+                </ee:transform>
+                
+                <choice doc:name="Validation Result">
+                        <when expression="#[payload.isValid == true]">
+                                <!-- Parallel Processing for Order Creation -->
+                                <scatter-gather doc:name="Parallel Order Processing">
+                                        <route>
+                                                <!-- Customer Validation Route -->
+                                                <logger level="DEBUG" doc:name="Validating Customer" message="Validating customer: #[payload.validatedData.customerId]"/>
+                                                <db:select doc:name="Validate Customer" config-ref="Orders_Database_Config">
+                                                        <db:sql><![CDATA[SELECT 
+                                                                customer_id, 
+                                                                status, 
+                                                                credit_limit, 
+                                                                current_balance,
+                                                                loyalty_tier
+                                                        FROM customers 
+                                                        WHERE customer_id = :customerId 
+                                                        AND status = 'ACTIVE']]></db:sql>
+                                                        <db:input-parameters><![CDATA[#[{customerId: payload.validatedData.customerId}]]]></db:input-parameters>
+                                                </db:select>
+                                                <choice doc:name="Customer Status Check">
+                                                        <when expression="#[sizeOf(payload) > 0]">
+                                                                <set-variable value="#[payload[0]]" doc:name="Set Customer Info" variableName="customerInfo"/>
+                                                                <choice doc:name="Credit Check">
+                                                                        <when expression="#[vars.customerInfo.current_balance + payload.calculatedTotal > vars.customerInfo.credit_limit]">
+                                                                                <set-variable value="CREDIT_EXCEEDED" doc:name="Credit Exceeded" variableName="customerValidation"/>
+                                                                        </when>
+                                                                        <otherwise>
+                                                                                <set-variable value="VALID" doc:name="Customer Valid" variableName="customerValidation"/>
+                                                                        </otherwise>
+                                                                </choice>
+                                                        </when>
+                                                        <otherwise>
+                                                                <set-variable value="INVALID_CUSTOMER" doc:name="Invalid Customer" variableName="customerValidation"/>
+                                                        </otherwise>
+                                                </choice>
+                                        </route>
+                                        
+                                        <route>
+                                                <!-- Inventory Check Route -->
+                                                <logger level="DEBUG" doc:name="Checking Inventory" message="Checking inventory for #[sizeOf(payload.validatedData.items)] items"/>
+                                                <foreach doc:name="For Each Item" collection="#[payload.validatedData.items]">
+                                                        <db:select doc:name="Check Item Availability" config-ref="Orders_Database_Config">
+                                                                <db:sql><![CDATA[SELECT 
+                                                                        product_id, 
+                                                                        available_quantity, 
+                                                                        reserved_quantity,
+                                                                        status,
+                                                                        price
+                                                                FROM inventory 
+                                                                WHERE product_id = :productId]]></db:sql>
+                                                                <db:input-parameters><![CDATA[#[{productId: payload.productId}]]]></db:input-parameters>
+                                                        </db:select>
+                                                        <choice doc:name="Inventory Check">
+                                                                <when expression="#[sizeOf(payload) > 0 and payload[0].available_quantity >= payload.quantity]">
+                                                                        <logger level="DEBUG" doc:name="Item Available" message="Item #[payload.productId] available: #[payload[0].available_quantity]"/>
+                                                                </when>
+                                                                <otherwise>
+                                                                        <logger level="WARN" doc:name="Insufficient Inventory" message="Insufficient inventory for item: #[payload.productId]"/>
+                                                                        <raise-error doc:name="Inventory Error" type="APP:INSUFFICIENT_INVENTORY" description="#['Insufficient inventory for product: ' ++ payload.productId]"/>
+                                                                </otherwise>
+                                                        </choice>
+                                                </foreach>
+                                                <set-variable value="INVENTORY_AVAILABLE" doc:name="Inventory Valid" variableName="inventoryValidation"/>
+                                        </route>
+                                        
+                                        <route>
+                                                <!-- Payment Authorization Route -->
+                                                <logger level="DEBUG" doc:name="Authorizing Payment" message="Authorizing payment for amount: #[payload.calculatedTotal]"/>
+                                                <ee:transform doc:name="Prepare Payment Request">
+                                                        <ee:message>
+                                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        amount: payload.calculatedTotal,
+        currency: "USD",
+        paymentMethod: payload.validatedData.paymentMethod,
+        customerId: payload.validatedData.customerId,
+        orderId: payload.orderId,
+        description: "Order payment for " ++ sizeOf(payload.validatedData.items) ++ " items"
+}]]></ee:set-payload>
+                                                        </ee:message>
+                                                </ee:transform>
+                                                <http:request method="POST" doc:name="Authorize Payment" path="/v1/payments/authorize" config-ref="HTTP_Request_configuration">
+                                                        <http:headers><![CDATA[#[{
+                                                                "Authorization": "Bearer " ++ p('payment.api.key'),
+                                                                "Content-Type": "application/json"
+                                                        }]]]></http:headers>
+                                                </http:request>
+                                                <choice doc:name="Payment Authorization Result">
+                                                        <when expression="#[payload.status == 'APPROVED']">
+                                                                <set-variable value="#[payload.authorizationId]" doc:name="Set Auth ID" variableName="paymentAuthId"/>
+                                                                <set-variable value="AUTHORIZED" doc:name="Payment Authorized" variableName="paymentValidation"/>
+                                                        </when>
+                                                        <otherwise>
+                                                                <set-variable value="DECLINED" doc:name="Payment Declined" variableName="paymentValidation"/>
+                                                                <logger level="WARN" doc:name="Payment Declined" message="Payment declined: #[payload.reason default 'Unknown reason']"/>
+                                                        </otherwise>
+                                                </choice>
+                                                <error-handler>
+                                                        <on-error-continue enableNotifications="true" logException="true" doc:name="Payment Service Error" type="HTTP:CONNECTIVITY">
+                                                                <set-variable value="SERVICE_ERROR" doc:name="Payment Service Error" variableName="paymentValidation"/>
+                                                                <logger level="ERROR" doc:name="Payment Service Down" message="Payment service unavailable: #[error.description]"/>
+                                                        </on-error-continue>
+                                                </error-handler>
+                                        </route>
+                                </scatter-gather>
+                                
+                                <!-- Decision Logic Based on Validation Results -->
+                                <choice doc:name="Order Processing Decision">
+                                        <when expression="#[vars.customerValidation == 'VALID' and vars.inventoryValidation == 'INVENTORY_AVAILABLE' and vars.paymentValidation == 'AUTHORIZED']">
+                                                <!-- All validations passed - Create Order -->
+                                                <logger level="INFO" doc:name="Creating Order" message="All validations passed, creating order: #[vars.orderId]"/>
+                                                
+                                                <async doc:name="Async Processing">
+                                                        <!-- Reserve Inventory -->
+                                                        <foreach doc:name="Reserve Items" collection="#[payload[0].validatedData.items]">
+                                                                <db:update doc:name="Reserve Inventory" config-ref="Orders_Database_Config">
+                                                                        <db:sql><![CDATA[UPDATE inventory 
+                                                                        SET reserved_quantity = reserved_quantity + :quantity,
+                                                                                available_quantity = available_quantity - :quantity
+                                                                        WHERE product_id = :productId]]></db:sql>
+                                                                        <db:input-parameters><![CDATA[#[{
+                                                                                quantity: payload.quantity,
+                                                                                productId: payload.productId
+                                                                        }]]]></db:input-parameters>
+                                                                </db:update>
+                                                        </foreach>
+                                                        
+                                                        <!-- Create Order Record -->
+                                                        <ee:transform doc:name="Prepare Order Data">
+                                                                <ee:message>
+                                                                        <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+{
+        orderId: vars.orderId,
+        customerId: payload[0].validatedData.customerId,
+        orderDate: vars.orderTimestamp,
+        status: "CONFIRMED",
+        totalAmount: payload[0].calculatedTotal,
+        paymentAuthId: vars.paymentAuthId,
+        shippingAddress: write(payload[0].validatedData.shippingAddress, "application/json"),
+        items: payload[0].validatedData.items
+}]]></ee:set-payload>
+                                                                </ee:message>
+                                                        </ee:transform>
+                                                        
+                                                        <db:insert doc:name="Insert Order" config-ref="Orders_Database_Config">
+                                                                <db:sql><![CDATA[INSERT INTO orders (
+                                                                        order_id, 
+                                                                        customer_id, 
+                                                                        order_date, 
+                                                                        status, 
+                                                                        total_amount, 
+                                                                        payment_auth_id,
+                                                                        shipping_address
+                                                                ) VALUES (
+                                                                        :orderId,
+                                                                        :customerId,
+                                                                        :orderDate,
+                                                                        :status,
+                                                                        :totalAmount,
+                                                                        :paymentAuthId,
+                                                                        :shippingAddress
+                                                                )]]></db:sql>
+                                                                <db:input-parameters><![CDATA[#[payload]]]></db:input-parameters>
+                                                        </db:insert>
+                                                        
+                                                        <!-- Insert Order Items -->
+                                                        <foreach doc:name="Insert Order Items" collection="#[payload.items]">
+                                                                <db:insert doc:name="Insert Order Item" config-ref="Orders_Database_Config">
+                                                                        <db:sql><![CDATA[INSERT INTO order_items (
+                                                                                order_id,
+                                                                                product_id,
+                                                                                quantity,
+                                                                                unit_price,
+                                                                                total_price
+                                                                        ) VALUES (
+                                                                                :orderId,
+                                                                                :productId,
+                                                                                :quantity,
+                                                                                :unitPrice,
+                                                                                :totalPrice
+                                                                        )]]></db:sql>
+                                                                        <db:input-parameters><![CDATA[#[{
+                                                                                orderId: vars.orderId,
+                                                                                productId: payload.productId,
+                                                                                quantity: payload.quantity,
+                                                                                unitPrice: payload.unitPrice,
+                                                                                totalPrice: payload.quantity * payload.unitPrice
+                                                                        }]]]></db:input-parameters>
+                                                                </db:insert>
+                                                        </foreach>
+                                                        
+                                                        <!-- Send to Order Processing Queue -->
+                                                        <jms:publish doc:name="Publish to Order Queue" config-ref="JMS_Config" destination="order.processing.queue">
+                                                                <jms:message>
+                                                                        <jms:body><![CDATA[#[{
+                                                                                orderId: vars.orderId,
+                                                                                customerId: payload.customerId,
+                                                                                totalAmount: payload.totalAmount,
+                                                                                status: payload.status,
+                                                                                timestamp: vars.orderTimestamp
+                                                                        }]]]></jms:body>
+                                                                </jms:message>
+                                                        </jms:publish>
+                                                        
+                                                        <!-- Update Salesforce -->
+                                                        <try doc:name="Update Salesforce">
+                                                                <salesforce:create doc:name="Create Salesforce Opportunity" config-ref="Salesforce_Config" type="Opportunity">
+                                                                        <salesforce:records><![CDATA[#[[{
+                                                                                Name: "Order " ++ vars.orderId,
+                                                                                AccountId: payload.customerId,
+                                                                                Amount: payload.totalAmount,
+                                                                                StageName: "Closed Won",
+                                                                                CloseDate: now() as Date,
+                                                                                Type: "Existing Customer - Upgrade"
+                                                                        }]]]]></salesforce:records>
+                                                                </salesforce:create>
+                                                                <logger level="INFO" doc:name="Salesforce Updated" message="Salesforce opportunity created for order: #[vars.orderId]"/>
+                                                                <error-handler>
+                                                                        <on-error-continue enableNotifications="true" logException="true" doc:name="Salesforce Error" type="ANY">
+                                                                                <logger level="WARN" doc:name="Salesforce Sync Failed" message="Failed to sync order to Salesforce: #[error.description]"/>
+                                                                        </on-error-continue>
+                                                                </error-handler>
+                                                        </try>
+                                                        
+                                                        <!-- Send Confirmation Email -->
+                                                        <try doc:name="Send Email">
+                                                                <ee:transform doc:name="Prepare Email">
+                                                                        <ee:message>
+                                                                                <ee:set-payload><![CDATA[%dw 2.0
+output text/html
+---
+"<html><body>
+<h2>Order Confirmation</h2>
+<p>Dear Customer,</p>
+<p>Your order #" ++ vars.orderId ++ " has been confirmed.</p>
+<p>Order Total: $" ++ payload.totalAmount ++ "</p>
+<p>Thank you for your business!</p>
+</body></html>"]]></ee:set-payload>
+                                                                        </ee:message>
+                                                                </ee:transform>
+                                                                <email:send doc:name="Send Confirmation Email" config-ref="Email_SMTP" subject="#['Order Confirmation - ' ++ vars.orderId]">
+                                                                        <email:to-addresses>
+                                                                                <email:to-address value="#[vars.customerInfo.email]"/>
+                                                                        </email:to-addresses>
+                                                                </email:send>
+                                                                <logger level="INFO" doc:name="Email Sent" message="Confirmation email sent for order: #[vars.orderId]"/>
+                                                                <error-handler>
+                                                                        <on-error-continue enableNotifications="true" logException="true" doc:name="Email Error" type="ANY">
+                                                                                <logger level="WARN" doc:name="Email Failed" message="Failed to send confirmation email: #[error.description]"/>
+                                                                        </on-error-continue>
+                                                                </error-handler>
+                                                        </try>
+                                                </async>
+                                                
+                                                <!-- Return Success Response -->
+                                                <ee:transform doc:name="Order Success Response">
+                                                        <ee:message>
+                                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        success: true,
+        orderId: vars.orderId,
+        status: "CONFIRMED",
+        totalAmount: payload[0].calculatedTotal,
+        estimatedDelivery: (now() + |P3D|) as String,
+        message: "Order created successfully",
+        timestamp: vars.orderTimestamp
+}]]></ee:set-payload>
+                                                        </ee:message>
+                                                        <ee:variables>
+                                                                <ee:set-variable variableName="httpStatus">201</ee:set-variable>
+                                                        </ee:variables>
+                                                </ee:transform>
+                                                <logger level="INFO" doc:name="Order Created Successfully" message="Order #[vars.orderId] created successfully"/>
+                                        </when>
+                                        
+                                        <when expression="#[vars.customerValidation == 'CREDIT_EXCEEDED']">
+                                                <logger level="WARN" doc:name="Credit Limit Exceeded" message="Credit limit exceeded for customer: #[payload[0].validatedData.customerId]"/>
+                                                <ee:transform doc:name="Credit Limit Error">
+                                                        <ee:message>
+                                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        error: "CREDIT_LIMIT_EXCEEDED",
+        message: "Order amount exceeds available credit limit",
+        availableCredit: vars.customerInfo.credit_limit - vars.customerInfo.current_balance,
+        orderAmount: payload[0].calculatedTotal,
+        timestamp: now()
+}]]></ee:set-payload>
+                                                        </ee:message>
+                                                        <ee:variables>
+                                                                <ee:set-variable variableName="httpStatus">402</ee:set-variable>
+                                                        </ee:variables>
+                                                </ee:transform>
+                                        </when>
+                                        
+                                        <when expression="#[vars.paymentValidation == 'DECLINED']">
+                                                <logger level="WARN" doc:name="Payment Declined" message="Payment declined for order: #[vars.orderId]"/>
+                                                <ee:transform doc:name="Payment Declined Error">
+                                                        <ee:message>
+                                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        error: "PAYMENT_DECLINED",
+        message: "Payment authorization was declined",
+        orderId: vars.orderId,
+        timestamp: now()
+}]]></ee:set-payload>
+                                                        </ee:message>
+                                                        <ee:variables>
+                                                                <ee:set-variable variableName="httpStatus">402</ee:set-variable>
+                                                        </ee:variables>
+                                                </ee:transform>
+                                        </when>
+                                        
+                                        <otherwise>
+                                                <logger level="ERROR" doc:name="Order Processing Failed" message="Order processing failed - Customer: #[vars.customerValidation], Inventory: #[vars.inventoryValidation], Payment: #[vars.paymentValidation]"/>
+                                                <ee:transform doc:name="Processing Failed Error">
+                                                        <ee:message>
+                                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        error: "ORDER_PROCESSING_FAILED",
+        message: "Order could not be processed due to validation failures",
+        details: {
+                customer: vars.customerValidation,
+                inventory: vars.inventoryValidation,
+                payment: vars.paymentValidation
+        },
+        timestamp: now()
+}]]></ee:set-payload>
+                                                        </ee:message>
+                                                        <ee:variables>
+                                                                <ee:set-variable variableName="httpStatus">400</ee:set-variable>
+                                                        </ee:variables>
+                                                </ee:transform>
+                                        </otherwise>
+                                </choice>
+                        </when>
+                        <otherwise>
+                                <logger level="WARN" doc:name="Validation Failed" message="Order validation failed: #[payload.errors]"/>
+                                <ee:transform doc:name="Validation Error Response">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        error: "VALIDATION_ERROR",
+        message: "Order data validation failed",
+        errors: payload.errors,
+        timestamp: now()
+}]]></ee:set-payload>
+                                        </ee:message>
+                                        <ee:variables>
+                                                <ee:set-variable variableName="httpStatus">400</ee:set-variable>
+                                        </ee:variables>
+                                </ee:transform>
+                        </otherwise>
+                </choice>
+                
+                <error-handler>
+                        <on-error-propagate enableNotifications="true" logException="true" doc:name="Inventory Error" type="APP:INSUFFICIENT_INVENTORY">
+                                <logger level="ERROR" doc:name="Insufficient Inventory" message="Insufficient inventory: #[error.description]"/>
+                                <ee:transform doc:name="Inventory Error Response">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        error: "INSUFFICIENT_INVENTORY",
+        message: error.description,
+        timestamp: now()
+}]]></ee:set-payload>
+                                        </ee:message>
+                                        <ee:variables>
+                                                <ee:set-variable variableName="httpStatus">409</ee:set-variable>
+                                        </ee:variables>
+                                </ee:transform>
+                        </on-error-propagate>
+                        <on-error-propagate enableNotifications="true" logException="true" doc:name="Database Error" type="DB:CONNECTIVITY">
+                                <logger level="ERROR" doc:name="Database Connection Error" message="Database connectivity error: #[error.description]"/>
+                                <ee:transform doc:name="Database Error Response">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        error: "DATABASE_ERROR",
+        message: "Unable to connect to order database",
+        timestamp: now()
+}]]></ee:set-payload>
+                                        </ee:message>
+                                        <ee:variables>
+                                                <ee:set-variable variableName="httpStatus">503</ee:set-variable>
+                                        </ee:variables>
+                                </ee:transform>
+                        </on-error-propagate>
+                </error-handler>
+        </flow>
+
+        <flow name="batch-process-orders-flow">
+                <logger level="INFO" doc:name="Start Batch Processing" message="Starting batch order processing"/>
+                <file:read doc:name="Read Batch File" path="#[attributes.queryParams.filePath]"/>
+                <ee:transform doc:name="Parse CSV Orders">
+                        <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+import * from dw::module::csv
+
+var csvData = payload as String
+var orders = csvData splitBy "\n" 
+        filter ($ != "")
+        map (line) -> line splitBy ","
+        filter (sizeOf($) >= 4)
+        map (fields) -> {
+                customerId: fields[0],
+                productId: fields[1],
+                quantity: fields[2] as Number,
+                unitPrice: fields[3] as Number
+        }
+---
+{
+        totalOrders: sizeOf(orders),
+        orders: orders
+}]]></ee:set-payload>
+                        </ee:message>
+                </ee:transform>
+                
+                <foreach doc:name="Process Each Order" collection="#[payload.orders]" batchSize="10">
+                        <async doc:name="Async Order Processing">
+                                <try doc:name="Process Single Order">
+                                        <flow-ref doc:name="Process Order" name="create-order-flow"/>
+                                        <logger level="INFO" doc:name="Batch Order Success" message="Batch order processed successfully"/>
+                                        <error-handler>
+                                                <on-error-continue enableNotifications="true" logException="true" doc:name="Continue on Error" type="ANY">
+                                                        <logger level="ERROR" doc:name="Batch Order Failed" message="Failed to process batch order: #[error.description]"/>
+                                                </on-error-continue>
+                                        </error-handler>
+                                </try>
+                        </async>
+                </foreach>
+                
+                <ee:transform doc:name="Batch Processing Response">
+                        <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        message: "Batch processing initiated",
+        totalOrders: payload.totalOrders,
+        status: "PROCESSING",
+        timestamp: now()
+}]]></ee:set-payload>
+                        </ee:message>
+                </ee:transform>
+        </flow>
+
+        <flow name="update-order-flow">
+                <logger level="INFO" doc:name="Update Order Start" message="Updating order: #[attributes.uriParams.orderId]"/>
+                <set-variable value="#[attributes.uriParams.orderId]" doc:name="Set Order ID" variableName="orderId"/>
+                
+                <db:select doc:name="Get Current Order" config-ref="Orders_Database_Config">
+                        <db:sql><![CDATA[SELECT order_id, status, customer_id FROM orders WHERE order_id = :orderId]]></db:sql>
+                        <db:input-parameters><![CDATA[#[{orderId: vars.orderId}]]]></db:input-parameters>
+                </db:select>
+                
+                <choice doc:name="Order Exists?">
+                        <when expression="#[sizeOf(payload) > 0]">
+                                <ee:transform doc:name="Update Order Status">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        message: "Order updated successfully",
+        orderId: vars.orderId,
+        timestamp: now()
+}]]></ee:set-payload>
+                                        </ee:message>
+                                </ee:transform>
+                        </when>
+                        <otherwise>
+                                <ee:transform doc:name="Order Not Found">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        error: "ORDER_NOT_FOUND",
+        message: "Order with ID " ++ vars.orderId ++ " not found",
+        timestamp: now()
+}]]></ee:set-payload>
+                                        </ee:message>
+                                        <ee:variables>
+                                                <ee:set-variable variableName="httpStatus">404</ee:set-variable>
+                                        </ee:variables>
+                                </ee:transform>
+                        </otherwise>
+                </choice>
+        </flow>
+
+        <flow name="get-order-flow">
+                <logger level="INFO" doc:name="Get Order Start" message="Retrieving order: #[attributes.uriParams.orderId]"/>
+                <set-variable value="#[attributes.uriParams.orderId]" doc:name="Set Order ID" variableName="orderId"/>
+                
+                <db:select doc:name="Get Order Details" config-ref="Orders_Database_Config">
+                        <db:sql><![CDATA[SELECT 
+                                o.order_id,
+                                o.customer_id,
+                                o.order_date,
+                                o.status,
+                                o.total_amount,
+                                oi.product_id,
+                                oi.quantity,
+                                oi.unit_price
+                        FROM orders o
+                        LEFT JOIN order_items oi ON o.order_id = oi.order_id
+                        WHERE o.order_id = :orderId]]></db:sql>
+                        <db:input-parameters><![CDATA[#[{orderId: vars.orderId}]]]></db:input-parameters>
+                </db:select>
+                
+                <choice doc:name="Order Found?">
+                        <when expression="#[sizeOf(payload) > 0]">
+                                <ee:transform doc:name="Format Order Response">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        orderId: payload[0].order_id,
+        customerId: payload[0].customer_id,
+        orderDate: payload[0].order_date,
+        status: payload[0].status,
+        totalAmount: payload[0].total_amount,
+        items: payload map {
+                productId: $.product_id,
+                quantity: $.quantity,
+                unitPrice: $.unit_price
+        }
+}]]></ee:set-payload>
+                                        </ee:message>
+                                </ee:transform>
+                        </when>
+                        <otherwise>
+                                <ee:transform doc:name="Order Not Found Response">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        error: "ORDER_NOT_FOUND",
+        message: "Order with ID " ++ vars.orderId ++ " not found",
+        timestamp: now()
+}]]></ee:set-payload>
+                                        </ee:message>
+                                        <ee:variables>
+                                                <ee:set-variable variableName="httpStatus">404</ee:set-variable>
+                                        </ee:variables>
+                                </ee:transform>
+                        </otherwise>
+                </choice>
+        </flow>
+
+</mule>

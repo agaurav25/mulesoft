@@ -1,0 +1,354 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xmlns:http="http://www.mulesoft.org/schema/mule/http"
+        xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+        xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+        xmlns:db="http://www.mulesoft.org/schema/mule/db"
+        xmlns:validation="http://www.mulesoft.org/schema/mule/validation"
+        xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+                http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+                http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+                http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+                http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+                http://www.mulesoft.org/schema/mule/validation http://www.mulesoft.org/schema/mule/validation/current/mule-validation.xsd">
+
+        <http:listener-config name="customer-api-httpListenerConfig" host="0.0.0.0" port="8081" />
+        <apikit:config name="customer-api-config" raml="customer-api.raml" outboundHeadersMapName="outboundHeaders" httpStatusVarName="httpStatus" />
+        
+        <db:config name="Database_Config" >
+                <db:my-sql-connection host="localhost" port="3306" user="admin" password="secret" database="customer_db" />
+        </db:config>
+
+        <flow name="customer-api-main">
+                <http:listener doc:name="Listener" config-ref="customer-api-httpListenerConfig" path="/api/*"/>
+                <apikit:router config-ref="customer-api-config" />
+                <error-handler>
+                        <on-error-propagate enableNotifications="true" logException="true" doc:name="On Error Propagate" type="APIKIT:BAD_REQUEST">
+                                <ee:transform doc:name="Transform Message">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{message: "Bad request"}]]></ee:set-payload>
+                                        </ee:message>
+                                </ee:transform>
+                        </on-error-propagate>
+                        <on-error-propagate enableNotifications="true" logException="true" doc:name="On Error Propagate" type="APIKIT:NOT_FOUND">
+                                <ee:transform doc:name="Transform Message">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{message: "Resource not found"}]]></ee:set-payload>
+                                        </ee:message>
+                                </ee:transform>
+                        </on-error-propagate>
+                </error-handler>
+        </flow>
+
+        <flow name="get:\customers:customer-api-config">
+                <logger level="INFO" doc:name="Logger" message="Getting all customers"/>
+                <set-variable value="#[attributes.queryParams.limit default 10]" doc:name="Set Variable" variableName="limit"/>
+                <set-variable value="#[attributes.queryParams.offset default 0]" doc:name="Set Variable" variableName="offset"/>
+                <validation:is-number numberType="INTEGER" doc:name="Validate limit" value="#[vars.limit]">
+                        <validation:on-error>
+                                <raise-error doc:name="Raise error" type="APP:INVALID_PARAMETER" description="Limit must be a valid integer"/>
+                        </validation:on-error>
+                </validation:is-number>
+                <db:select doc:name="Select customers" config-ref="Database_Config">
+                        <db:sql><![CDATA[SELECT 
+                                c.customer_id,
+                                c.first_name,
+                                c.last_name,
+                                c.email,
+                                c.phone,
+                                c.registration_date,
+                                c.status,
+                                a.street_address,
+                                a.city,
+                                a.state,
+                                a.postal_code,
+                                a.country
+                        FROM customers c
+                        LEFT JOIN addresses a ON c.customer_id = a.customer_id
+                        WHERE c.status = 'ACTIVE'
+                        ORDER BY c.registration_date DESC
+                        LIMIT :limit OFFSET :offset]]></db:sql>
+                        <db:input-parameters><![CDATA[#[{
+                                limit: vars.limit,
+                                offset: vars.offset
+                        }]]]></db:input-parameters>
+                </db:select>
+                <choice doc:name="Choice">
+                        <when expression="#[sizeOf(payload) &gt; 0]">
+                                <ee:transform doc:name="Transform to API Response">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        customers: payload map (customer, index) -> {
+                customerId: customer.customer_id,
+                firstName: customer.first_name,
+                lastName: customer.last_name,
+                email: customer.email,
+                phone: customer.phone,
+                registrationDate: customer.registration_date,
+                status: customer.status,
+                address: {
+                        street: customer.street_address,
+                        city: customer.city,
+                        state: customer.state,
+                        postalCode: customer.postal_code,
+                        country: customer.country
+                }
+        },
+        metadata: {
+                total: sizeOf(payload),
+                limit: vars.limit,
+                offset: vars.offset
+        }
+}]]></ee:set-payload>
+                                        </ee:message>
+                                </ee:transform>
+                                <logger level="INFO" doc:name="Logger" message="Successfully retrieved #[sizeOf(payload.customers)] customers"/>
+                        </when>
+                        <otherwise>
+                                <ee:transform doc:name="Empty Response">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        customers: [],
+        metadata: {
+                total: 0,
+                limit: vars.limit,
+                offset: vars.offset
+        }
+}]]></ee:set-payload>
+                                        </ee:message>
+                                </ee:transform>
+                                <logger level="INFO" doc:name="Logger" message="No customers found"/>
+                        </otherwise>
+                </choice>
+                <error-handler>
+                        <on-error-propagate enableNotifications="true" logException="true" doc:name="On Error Propagate" type="DB:CONNECTIVITY">
+                                <logger level="ERROR" doc:name="Logger" message="Database connectivity error: #[error.description]"/>
+                                <ee:transform doc:name="Database Error Response">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        error: "DATABASE_ERROR",
+        message: "Unable to connect to customer database",
+        timestamp: now()
+}]]></ee:set-payload>
+                                        </ee:message>
+                                        <ee:variables>
+                                                <ee:set-variable variableName="httpStatus">500</ee:set-variable>
+                                        </ee:variables>
+                                </ee:transform>
+                        </on-error-propagate>
+                </error-handler>
+        </flow>
+
+        <flow name="post:\customers:customer-api-config">
+                <logger level="INFO" doc:name="Logger" message="Creating new customer"/>
+                <ee:transform doc:name="Validate Input">
+                        <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+import * from dw::core::Strings
+
+var requiredFields = ["firstName", "lastName", "email", "phone"]
+var emailPattern = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/
+var phonePattern = /^\+?[\d\s\-\(\)]+$/
+
+var validationErrors = payload.* pluck (value, key) -> 
+        if (requiredFields contains key as String)
+                if (isEmpty(value) or value == null)
+                        "Field " ++ key ++ " is required"
+                else if (key == "email" and not (value matches emailPattern))
+                        "Invalid email format"
+                else if (key == "phone" and not (value matches phonePattern))
+                        "Invalid phone format"
+                else null
+        else null
+        filter ($ != null)
+
+---
+{
+        isValid: isEmpty(validationErrors),
+        errors: validationErrors,
+        validatedData: if (isEmpty(validationErrors)) payload else {}
+}]]></ee:set-payload>
+                        </ee:message>
+                </ee:transform>
+                <choice doc:name="Valid Input?">
+                        <when expression="#[payload.isValid == true]">
+                                <scatter-gather doc:name="Scatter-Gather">
+                                        <route>
+                                                <try doc:name="Try">
+                                                        <db:select doc:name="Check Email Exists" config-ref="Database_Config">
+                                                                <db:sql><![CDATA[SELECT customer_id FROM customers WHERE email = :email]]></db:sql>
+                                                                <db:input-parameters><![CDATA[#[{email: payload.validatedData.email}]]]></db:input-parameters>
+                                                        </db:select>
+                                                        <choice doc:name="Email Exists?">
+                                                                <when expression="#[sizeOf(payload) &gt; 0]">
+                                                                        <set-variable value="true" doc:name="Set Email Exists" variableName="emailExists"/>
+                                                                </when>
+                                                                <otherwise>
+                                                                        <set-variable value="false" doc:name="Set Email Available" variableName="emailExists"/>
+                                                                </otherwise>
+                                                        </choice>
+                                                        <error-handler>
+                                                                <on-error-continue enableNotifications="true" logException="true" doc:name="On Error Continue" type="ANY">
+                                                                        <set-variable value="error" doc:name="Set Check Failed" variableName="emailExists"/>
+                                                                        <logger level="WARN" doc:name="Logger" message="Failed to check email existence: #[error.description]"/>
+                                                                </on-error-continue>
+                                                        </error-handler>
+                                                </try>
+                                        </route>
+                                </scatter-gather>
+                                <choice doc:name="Can Create Customer?">
+                                        <when expression="#[vars.emailExists != true]">
+                                                <ee:transform doc:name="Prepare Customer Data">
+                                                        <ee:message>
+                                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+{
+        customer: {
+                firstName: payload[0].validatedData.firstName,
+                lastName: payload[0].validatedData.lastName,
+                email: payload[0].validatedData.email,
+                phone: payload[0].validatedData.phone,
+                registrationDate: now(),
+                status: "ACTIVE"
+        }
+}]]></ee:set-payload>
+                                                        </ee:message>
+                                                </ee:transform>
+                                                <try doc:name="Try">
+                                                        <db:insert doc:name="Insert Customer" config-ref="Database_Config" autoGenerateKeys="true">
+                                                                <db:sql><![CDATA[INSERT INTO customers (
+                                                                        first_name, 
+                                                                        last_name, 
+                                                                        email, 
+                                                                        phone, 
+                                                                        registration_date, 
+                                                                        status
+                                                                ) VALUES (
+                                                                        :firstName,
+                                                                        :lastName,
+                                                                        :email,
+                                                                        :phone,
+                                                                        :registrationDate,
+                                                                        :status
+                                                                )]]></db:sql>
+                                                                <db:input-parameters><![CDATA[#[payload.customer]]]></db:input-parameters>
+                                                        </db:insert>
+                                                        <set-variable value="#[payload.generatedKeys.GENERATED_KEY]" doc:name="Set Customer ID" variableName="newCustomerId"/>
+                                                        <ee:transform doc:name="Customer Created Response">
+                                                                <ee:message>
+                                                                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        message: "Customer created successfully",
+        customerId: vars.newCustomerId,
+        timestamp: now()
+}]]></ee:set-payload>
+                                                                </ee:message>
+                                                                <ee:variables>
+                                                                        <ee:set-variable variableName="httpStatus">201</ee:set-variable>
+                                                                </ee:variables>
+                                                        </ee:transform>
+                                                        <logger level="INFO" doc:name="Logger" message="Successfully created customer with ID: #[vars.newCustomerId]"/>
+                                                        <error-handler>
+                                                                <on-error-propagate enableNotifications="true" logException="true" doc:name="On Error Propagate" type="DB:DUPLICATE_KEY">
+                                                                        <logger level="ERROR" doc:name="Logger" message="Duplicate customer data: #[error.description]"/>
+                                                                        <ee:transform doc:name="Duplicate Error">
+                                                                                <ee:message>
+                                                                                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        error: "DUPLICATE_CUSTOMER",
+        message: "A customer with this email already exists",
+        timestamp: now()
+}]]></ee:set-payload>
+                                                                                </ee:message>
+                                                                                <ee:variables>
+                                                                                        <ee:set-variable variableName="httpStatus">409</ee:set-variable>
+                                                                                </ee:variables>
+                                                                        </ee:transform>
+                                                                </on-error-propagate>
+                                                        </error-handler>
+                                                </try>
+                                        </when>
+                                        <otherwise>
+                                                <logger level="WARN" doc:name="Logger" message="Email already exists: #[payload[0].validatedData.email]"/>
+                                                <ee:transform doc:name="Email Exists Error">
+                                                        <ee:message>
+                                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        error: "EMAIL_EXISTS",
+        message: "A customer with this email address already exists",
+        timestamp: now()
+}]]></ee:set-payload>
+                                                        </ee:message>
+                                                        <ee:variables>
+                                                                <ee:set-variable variableName="httpStatus">409</ee:set-variable>
+                                                        </ee:variables>
+                                                </ee:transform>
+                                        </otherwise>
+                                </choice>
+                        </when>
+                        <otherwise>
+                                <logger level="WARN" doc:name="Logger" message="Invalid input data: #[payload.errors]"/>
+                                <ee:transform doc:name="Validation Error">
+                                        <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+        error: "VALIDATION_ERROR",
+        message: "Invalid input data",
+        errors: payload.errors,
+        timestamp: now()
+}]]></ee:set-payload>
+                                        </ee:message>
+                                        <ee:variables>
+                                                <ee:set-variable variableName="httpStatus">400</ee:set-variable>
+                                        </ee:variables>
+                                </ee:transform>
+                        </otherwise>
+                </choice>
+        </flow>
+
+        <sub-flow name="get-customer-details-subflow">
+                <db:select doc:name="Get Customer with Address" config-ref="Database_Config">
+                        <db:sql><![CDATA[SELECT 
+                                c.customer_id,
+                                c.first_name,
+                                c.last_name,
+                                c.email,
+                                c.phone,
+                                c.registration_date,
+                                c.status,
+                                c.created_at,
+                                c.updated_at
+                        FROM customers c
+                        WHERE c.customer_id = :customerId
+                        AND c.status != 'DELETED']]></db:sql>
+                        <db:input-parameters><![CDATA[#[{customerId: vars.customerId}]]]></db:input-parameters>
+                </db:select>
+        </sub-flow>
+
+</mule>
